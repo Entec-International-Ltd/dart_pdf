@@ -149,7 +149,7 @@ override public var numberOfPages: Int {
     // NEW SAFETY GUARD: Localize the reference to avoid race conditions
     // during the CoreGraphics call.
     if let doc = pdfDocument {
-        return CGPDFDocumentGetNumberOfPages(doc)
+        return doc.numberOfPages
     }
     
     print("DEBUG: pdfDocument was nil or timed out.")
