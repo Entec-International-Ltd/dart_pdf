@@ -5,7 +5,7 @@
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -37,6 +37,7 @@ public class PrintJob: UIPrintPageRenderer, UIPrintInteractionControllerDelegate
     private var printerName: String?
     private var orientation: UIPrintInfo.Orientation?
     private let semaphore = DispatchSemaphore(value: 0)
+    private let lock = NSLock() // ATOMIC LOCK: Prevents race conditions during document lifecycle
     private var dynamic = false
     private var currentSize: CGSize?
     private var forceCustomPrintPaper = false
@@ -50,7 +51,11 @@ public class PrintJob: UIPrintPageRenderer, UIPrintInteractionControllerDelegate
 
     override public func drawPage(at pageIndex: Int, in _: CGRect) {
         let ctx = UIGraphicsGetCurrentContext()
+        
+        lock.lock()
         let page = pdfDocument?.page(at: pageIndex + 1)
+        lock.unlock()
+        
         ctx?.scaleBy(x: 1.0, y: -1.0)
         ctx?.translateBy(x: 0.0, y: -paperRect.size.height)
         if page != nil {
@@ -59,7 +64,10 @@ public class PrintJob: UIPrintPageRenderer, UIPrintInteractionControllerDelegate
     }
 
     func cancelJob(_ error: String?) {
+        lock.lock()
         pdfDocument = nil
+        lock.unlock()
+        
         if dynamic {
             semaphore.signal()
         } else {
@@ -71,7 +79,10 @@ public class PrintJob: UIPrintPageRenderer, UIPrintInteractionControllerDelegate
         let bytesPointer = UnsafeMutablePointer<UInt8>.allocate(capacity: data?.count ?? 0)
         data?.copyBytes(to: bytesPointer, count: data?.count ?? 0)
         let dataProvider = CGDataProvider(dataInfo: nil, data: bytesPointer, size: data?.count ?? 0, releaseData: dataProviderReleaseDataCallback)
+        
+        lock.lock()
         pdfDocument = CGPDFDocument(dataProvider!)
+        lock.unlock()
 
         if dynamic {
             // Unblock the main thread
@@ -121,40 +132,42 @@ public class PrintJob: UIPrintPageRenderer, UIPrintInteractionControllerDelegate
         }
     }
 
-override public var numberOfPages: Int {
-    if dynamic {
-        let width = paperRect.size.width
+    override public var numberOfPages: Int {
+        if dynamic {
+            let width = paperRect.size.width
+            // BAIL OUT: 480 is the transition bug on iPad
+            if width == 480 {
+                print("DEBUG: Bailing out of 480px layout.")
+                return 0
+            }
+
+            printing.onLayout(
+                printJob: self,
+                width: width,
+                height: paperRect.size.height,
+                marginLeft: printableRect.origin.x,
+                marginTop: printableRect.origin.y,
+                marginRight: paperRect.size.width - (printableRect.origin.x + printableRect.size.width),
+                marginBottom: paperRect.size.height - (printableRect.origin.y + printableRect.size.height)
+            )
+
+            let timeout = Date(timeIntervalSinceNow: 5.0)
+            while pdfDocument == nil && Date() < timeout {
+                RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.1))
+            }
+        }
+
+        // SAFETY GUARD: Use a lock to ensure the main thread doesn't delete 
+        // the document while we are reading the page count.
+        lock.lock()
+        defer { lock.unlock() }
         
-        if width == 480 {
-            print("DEBUG: Bailing out of 480px layout.")
-            return 0
+        if let doc = pdfDocument {
+            return doc.numberOfPages
         }
-
-        printing.onLayout(
-            printJob: self,
-            width: width,
-            height: paperRect.size.height,
-            marginLeft: printableRect.origin.x,
-            marginTop: printableRect.origin.y,
-            marginRight: paperRect.size.width - (printableRect.origin.x + printableRect.size.width),
-            marginBottom: paperRect.size.height - (printableRect.origin.y + printableRect.size.height)
-        )
-
-        let timeout = Date(timeIntervalSinceNow: 5.0)
-        while pdfDocument == nil && Date() < timeout {
-            RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.1))
-        }
+        
+        return 0
     }
-
-    // NEW SAFETY GUARD: Localize the reference to avoid race conditions
-    // during the CoreGraphics call.
-    if let doc = pdfDocument {
-        return doc.numberOfPages
-    }
-    
-    print("DEBUG: pdfDocument was nil or timed out.")
-    return 0
-}
 
     func completionHandler(printController _: UIPrintInteractionController, completed: Bool, error: Error?) {
         if !completed, error != nil {
@@ -233,9 +246,6 @@ override public var numberOfPages: Int {
                 selectedPrinters[printerURLString] = UIPrinter(url: printerURL!)
             }
 
-            // Sometimes using UIPrinter(url:) gives a non-contactable printer.
-            // https://stackoverflow.com/questions/34602302/creating-a-working-uiprinter-object-from-url-for-dialogue-free-printing
-            // This lets use a printer saved during picking and fall back using a printer created with UIPrinter(url:)
             if pickedPrinter != nil && selectedPrinters[printerURLString]!.url == pickedPrinter?.url {
                 controller.print(to: pickedPrinter!, completionHandler: completionHandler)
                 return
@@ -298,17 +308,13 @@ override public var numberOfPages: Int {
         wkWebView.loadHTMLString(data, baseURL: baseUrl ?? Bundle.main.bundleURL)
 
         urlObservation = wkWebView.observe(\.isLoading, changeHandler: { _, _ in
-            // this is workaround for issue with loading local images
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                // assign the print formatter to the print page renderer
                 let renderer = UIPrintPageRenderer()
                 renderer.addPrintFormatter(wkWebView.viewPrintFormatter(), startingAtPageAt: 0)
 
-                // assign paperRect and printableRect values
                 renderer.setValue(rect, forKey: "paperRect")
                 renderer.setValue(margin, forKey: "printableRect")
 
-                // create pdf context and draw each page
                 let pdfData = NSMutableData()
                 UIGraphicsBeginPDFContextToData(pdfData, rect, nil)
 
@@ -320,9 +326,8 @@ override public var numberOfPages: Int {
                 UIGraphicsEndPDFContext()
 
                 if let viewWithTag = viewController?.view.viewWithTag(wkWebView.tag) {
-                    viewWithTag.removeFromSuperview() // remove hidden webview when pdf is generated
+                    viewWithTag.removeFromSuperview()
 
-                    // clear WKWebView cache
                     if #available(iOS 9.0, *) {
                         WKWebsiteDataStore.default().fetchDataRecords(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes()) { records in
                             for record in records {
@@ -332,7 +337,6 @@ override public var numberOfPages: Int {
                     }
                 }
 
-                // dispose urlObservation
                 self.urlObservation = nil
                 self.printing.onHtmlRendered(printJob: self, pdfData: pdfData as Data)
             }
