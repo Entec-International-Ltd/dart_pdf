@@ -121,37 +121,40 @@ public class PrintJob: UIPrintPageRenderer, UIPrintInteractionControllerDelegate
         }
     }
 
-    override public var numberOfPages: Int {
-        if dynamic {
-            let width = paperRect.size.width
-            // BAIL OUT: 480 is the transition bug on iPad; avoid deadlock with Flutter's merged threads.
-            if width == 480 {
-                print("DEBUG: Bailing out of 480px layout to prevent 0x10 crash.")
-                return 0
-            }
-            printing.onLayout(
-                printJob: self,
-                width: width,
-                height: paperRect.size.height,
-                marginLeft: printableRect.origin.x,
-                marginTop: printableRect.origin.y,
-                marginRight: paperRect.size.width - (printableRect.origin.x + printableRect.size.width),
-                marginBottom: paperRect.size.height - (printableRect.origin.y + printableRect.size.height)
-            )
-
-            // Non-blocking RunLoop polling (avoids semaphore deadlock with Flutter's merged threads)
-            let timeout = Date(timeIntervalSinceNow: 5.0)
-            while pdfDocument == nil && Date() < timeout {
-                RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.1))
-            }
-            if pdfDocument == nil {
-                print("DEBUG: PrintJob timed out waiting for PDF document.")
-                return 0
-            }
+override public var numberOfPages: Int {
+    if dynamic {
+        let width = paperRect.size.width
+        
+        if width == 480 {
+            print("DEBUG: Bailing out of 480px layout.")
+            return 0
         }
 
-        return pdfDocument?.numberOfPages ?? 0
+        printing.onLayout(
+            printJob: self,
+            width: width,
+            height: paperRect.size.height,
+            marginLeft: printableRect.origin.x,
+            marginTop: printableRect.origin.y,
+            marginRight: paperRect.size.width - (printableRect.origin.x + printableRect.size.width),
+            marginBottom: paperRect.size.height - (printableRect.origin.y + printableRect.size.height)
+        )
+
+        let timeout = Date(timeIntervalSinceNow: 5.0)
+        while pdfDocument == nil && Date() < timeout {
+            RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.1))
+        }
     }
+
+    // NEW SAFETY GUARD: Localize the reference to avoid race conditions
+    // during the CoreGraphics call.
+    if let doc = pdfDocument {
+        return CGPDFDocumentGetNumberOfPages(doc)
+    }
+    
+    print("DEBUG: pdfDocument was nil or timed out.")
+    return 0
+}
 
     func completionHandler(printController _: UIPrintInteractionController, completed: Bool, error: Error?) {
         if !completed, error != nil {
